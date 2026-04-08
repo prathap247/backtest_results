@@ -4,8 +4,43 @@ import os
 # -----------------------
 # SETTINGS
 # -----------------------
-SAFETY_SL_ENABLED = True   # Change to False if you don't want safety SL
-SAFETY_SL = 10.0           # Max loss allowed (price points)
+BB_PERIOD = 20
+BB_STD = 2
+
+RSI_PERIOD = 14
+RSI_BUY_LEVEL = 30
+RSI_SELL_LEVEL = 70
+
+SAFETY_SL_ENABLED = True
+SAFETY_SL = 10.0   # max loss in price points
+
+
+# -----------------------
+# INDICATORS
+# -----------------------
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
+
+
+def calculate_bollinger(df, period=20, std=2):
+    df["BB_MID"] = df["Close"].rolling(period).mean()
+    df["BB_STD"] = df["Close"].rolling(period).std()
+
+    df["BB_UPPER"] = df["BB_MID"] + (std * df["BB_STD"])
+    df["BB_LOWER"] = df["BB_MID"] - (std * df["BB_STD"])
+
+    return df
 
 
 # -----------------------
@@ -16,22 +51,28 @@ def backtest(df):
     position = None
 
     for i in range(1, len(df)):
-        row_prev = df.iloc[i - 1]
         row = df.iloc[i]
         time = df.index[i]
-
-        ema50_prev = row_prev["EMA50"]
-        ema200_prev = row_prev["EMA200"]
-        ema50 = row["EMA50"]
-        ema200 = row["EMA200"]
 
         close_price = row["Close"]
         high_price = row["High"]
         low_price = row["Low"]
 
-        # Detect crossover signals
-        buy_signal = (ema50_prev <= ema200_prev) and (ema50 > ema200)
-        sell_signal = (ema50_prev >= ema200_prev) and (ema50 < ema200)
+        bb_upper = row["BB_UPPER"]
+        bb_lower = row["BB_LOWER"]
+        bb_mid = row["BB_MID"]
+
+        rsi = row["RSI"]
+
+        # Skip rows until indicators are ready
+        if pd.isna(bb_upper) or pd.isna(bb_lower) or pd.isna(bb_mid) or pd.isna(rsi):
+            continue
+
+        # -----------------------
+        # ENTRY SIGNALS
+        # -----------------------
+        buy_signal = (close_price <= bb_lower) and (rsi < RSI_BUY_LEVEL)
+        sell_signal = (close_price >= bb_upper) and (rsi > RSI_SELL_LEVEL)
 
         # -----------------------
         # ENTRY
@@ -58,7 +99,7 @@ def backtest(df):
             trade_type = position["type"]
             entry_price = position["entry_price"]
 
-            # Safety SL logic
+            # Safety SL check
             if SAFETY_SL_ENABLED:
                 if trade_type == "BUY":
                     sl_price = entry_price - SAFETY_SL
@@ -86,8 +127,8 @@ def backtest(df):
                         position = None
                         continue
 
-            # Exit on opposite crossover
-            if trade_type == "BUY" and sell_signal:
+            # Exit at middle band
+            if trade_type == "BUY" and close_price >= bb_mid:
                 pnl = close_price - entry_price
                 trades.append({
                     **position,
@@ -98,7 +139,7 @@ def backtest(df):
                 })
                 position = None
 
-            elif trade_type == "SELL" and buy_signal:
+            elif trade_type == "SELL" and close_price <= bb_mid:
                 pnl = entry_price - close_price
                 trades.append({
                     **position,
@@ -222,13 +263,17 @@ def generate_report(trades_df, start_date, end_date):
         </style>
     </head>
     <body>
-        <h1>XAUUSD EMA50/EMA200 Backtest Report (15m)</h1>
+        <h1>XAUUSD Bollinger Bands + RSI Backtest Report (15m)</h1>
 
         <div class="box">
-            <h2>Settings</h2>
+            <h2>Strategy Settings</h2>
             <p><b>Date Range:</b> {start_date} → {end_date}</p>
-            <p><b>Entry:</b> EMA50/EMA200 Crossover</p>
-            <p><b>Exit:</b> Opposite Crossover</p>
+            <p><b>Bollinger Period:</b> {BB_PERIOD}</p>
+            <p><b>Bollinger Std Dev:</b> {BB_STD}</p>
+            <p><b>RSI Period:</b> {RSI_PERIOD}</p>
+            <p><b>Buy Condition:</b> Close <= Lower Band AND RSI < {RSI_BUY_LEVEL}</p>
+            <p><b>Sell Condition:</b> Close >= Upper Band AND RSI > {RSI_SELL_LEVEL}</p>
+            <p><b>Exit Condition:</b> Price reaches Middle Band</p>
             <p><b>Safety SL Enabled:</b> {SAFETY_SL_ENABLED}</p>
             <p><b>Safety SL Value:</b> {SAFETY_SL}</p>
         </div>
@@ -281,6 +326,10 @@ if __name__ == "__main__":
     if len(df) == 0:
         print("No data found after this start date.")
         exit()
+
+    # Calculate indicators
+    df = calculate_bollinger(df, BB_PERIOD, BB_STD)
+    df["RSI"] = calculate_rsi(df["Close"], RSI_PERIOD)
 
     start_range = df.index.min()
     end_range = df.index.max()

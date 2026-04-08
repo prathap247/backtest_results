@@ -4,41 +4,37 @@ import os
 # -----------------------
 # SETTINGS
 # -----------------------
-BB_PERIOD = 20
-BB_STD = 2
+SL_POINTS = 10.0
+RR = 2.5
+TP_POINTS = SL_POINTS * RR
 
-RSI_PERIOD = 14
-RSI_BUY_LEVEL = 30
-RSI_SELL_LEVEL = 70
-
-SAFETY_SL_ENABLED = True
-SAFETY_SL = 10.0   # max loss in price points
+EMA_PERIOD = 200
 
 
 # -----------------------
-# INDICATORS
+# EMA CALCULATION
 # -----------------------
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi
+def add_ema(df, period=200):
+    df["EMA200"] = df["Close"].ewm(span=period, adjust=False).mean()
+    return df
 
 
-def calculate_bollinger(df, period=20, std=2):
-    df["BB_MID"] = df["Close"].rolling(period).mean()
-    df["BB_STD"] = df["Close"].rolling(period).std()
+# -----------------------
+# PREVIOUS DAY LEVELS
+# -----------------------
+def add_previous_day_levels(df):
+    df["date_only"] = df.index.date
 
-    df["BB_UPPER"] = df["BB_MID"] + (std * df["BB_STD"])
-    df["BB_LOWER"] = df["BB_MID"] - (std * df["BB_STD"])
+    daily = df.groupby("date_only").agg({
+        "High": "max",
+        "Low": "min"
+    })
+
+    daily["PDH"] = daily["High"].shift(1)
+    daily["PDL"] = daily["Low"].shift(1)
+
+    df["PDH"] = df["date_only"].map(daily["PDH"])
+    df["PDL"] = df["date_only"].map(daily["PDL"])
 
     return df
 
@@ -50,7 +46,8 @@ def backtest(df):
     trades = []
     position = None
 
-    for i in range(1, len(df)):
+    for i in range(2, len(df)):  # start from 2 because confirmation needs previous candle
+        row_prev = df.iloc[i - 1]
         row = df.iloc[i]
         time = df.index[i]
 
@@ -58,21 +55,24 @@ def backtest(df):
         high_price = row["High"]
         low_price = row["Low"]
 
-        bb_upper = row["BB_UPPER"]
-        bb_lower = row["BB_LOWER"]
-        bb_mid = row["BB_MID"]
+        pdh = row["PDH"]
+        pdl = row["PDL"]
+        ema200 = row["EMA200"]
 
-        rsi = row["RSI"]
-
-        # Skip rows until indicators are ready
-        if pd.isna(bb_upper) or pd.isna(bb_lower) or pd.isna(bb_mid) or pd.isna(rsi):
+        if pd.isna(pdh) or pd.isna(pdl) or pd.isna(ema200):
             continue
 
         # -----------------------
-        # ENTRY SIGNALS
+        # Confirmation candle logic
         # -----------------------
-        buy_signal = (close_price <= bb_lower) and (rsi < RSI_BUY_LEVEL)
-        sell_signal = (close_price >= bb_upper) and (rsi > RSI_SELL_LEVEL)
+        buy_confirm = (row_prev["Close"] > pdh) and (close_price > pdh)
+        sell_confirm = (row_prev["Close"] < pdl) and (close_price < pdl)
+
+        # -----------------------
+        # Trend filter logic
+        # -----------------------
+        buy_signal = buy_confirm and (close_price > ema200)
+        sell_signal = sell_confirm and (close_price < ema200)
 
         # -----------------------
         # ENTRY
@@ -82,14 +82,18 @@ def backtest(df):
                 position = {
                     "type": "BUY",
                     "entry_time": time,
-                    "entry_price": close_price
+                    "entry_price": close_price,
+                    "sl": close_price - SL_POINTS,
+                    "tp": close_price + TP_POINTS
                 }
 
             elif sell_signal:
                 position = {
                     "type": "SELL",
                     "entry_time": time,
-                    "entry_price": close_price
+                    "entry_price": close_price,
+                    "sl": close_price + SL_POINTS,
+                    "tp": close_price - TP_POINTS
                 }
 
         # -----------------------
@@ -97,58 +101,48 @@ def backtest(df):
         # -----------------------
         else:
             trade_type = position["type"]
-            entry_price = position["entry_price"]
 
-            # Safety SL check
-            if SAFETY_SL_ENABLED:
-                if trade_type == "BUY":
-                    sl_price = entry_price - SAFETY_SL
-                    if low_price <= sl_price:
-                        trades.append({
-                            **position,
-                            "exit_time": time,
-                            "exit_price": sl_price,
-                            "result": "LOSS",
-                            "pnl": sl_price - entry_price
-                        })
-                        position = None
-                        continue
+            if trade_type == "BUY":
+                if low_price <= position["sl"]:
+                    trades.append({
+                        **position,
+                        "exit_time": time,
+                        "exit_price": position["sl"],
+                        "result": "LOSS",
+                        "pnl": -SL_POINTS
+                    })
+                    position = None
 
-                elif trade_type == "SELL":
-                    sl_price = entry_price + SAFETY_SL
-                    if high_price >= sl_price:
-                        trades.append({
-                            **position,
-                            "exit_time": time,
-                            "exit_price": sl_price,
-                            "result": "LOSS",
-                            "pnl": entry_price - sl_price
-                        })
-                        position = None
-                        continue
+                elif high_price >= position["tp"]:
+                    trades.append({
+                        **position,
+                        "exit_time": time,
+                        "exit_price": position["tp"],
+                        "result": "WIN",
+                        "pnl": TP_POINTS
+                    })
+                    position = None
 
-            # Exit at middle band
-            if trade_type == "BUY" and close_price >= bb_mid:
-                pnl = close_price - entry_price
-                trades.append({
-                    **position,
-                    "exit_time": time,
-                    "exit_price": close_price,
-                    "result": "WIN" if pnl > 0 else "LOSS",
-                    "pnl": pnl
-                })
-                position = None
+            elif trade_type == "SELL":
+                if high_price >= position["sl"]:
+                    trades.append({
+                        **position,
+                        "exit_time": time,
+                        "exit_price": position["sl"],
+                        "result": "LOSS",
+                        "pnl": -SL_POINTS
+                    })
+                    position = None
 
-            elif trade_type == "SELL" and close_price <= bb_mid:
-                pnl = entry_price - close_price
-                trades.append({
-                    **position,
-                    "exit_time": time,
-                    "exit_price": close_price,
-                    "result": "WIN" if pnl > 0 else "LOSS",
-                    "pnl": pnl
-                })
-                position = None
+                elif low_price <= position["tp"]:
+                    trades.append({
+                        **position,
+                        "exit_time": time,
+                        "exit_price": position["tp"],
+                        "result": "WIN",
+                        "pnl": TP_POINTS
+                    })
+                    position = None
 
     return pd.DataFrame(trades)
 
@@ -263,19 +257,16 @@ def generate_report(trades_df, start_date, end_date):
         </style>
     </head>
     <body>
-        <h1>XAUUSD Bollinger Bands + RSI Backtest Report (15m)</h1>
+        <h1>XAUUSD PDH/PDL Breakout + EMA200 + Confirmation (15m)</h1>
 
         <div class="box">
             <h2>Strategy Settings</h2>
             <p><b>Date Range:</b> {start_date} → {end_date}</p>
-            <p><b>Bollinger Period:</b> {BB_PERIOD}</p>
-            <p><b>Bollinger Std Dev:</b> {BB_STD}</p>
-            <p><b>RSI Period:</b> {RSI_PERIOD}</p>
-            <p><b>Buy Condition:</b> Close <= Lower Band AND RSI < {RSI_BUY_LEVEL}</p>
-            <p><b>Sell Condition:</b> Close >= Upper Band AND RSI > {RSI_SELL_LEVEL}</p>
-            <p><b>Exit Condition:</b> Price reaches Middle Band</p>
-            <p><b>Safety SL Enabled:</b> {SAFETY_SL_ENABLED}</p>
-            <p><b>Safety SL Value:</b> {SAFETY_SL}</p>
+            <p><b>Entry:</b> 2 Candle Close Breakout of PDH/PDL</p>
+            <p><b>Trend Filter:</b> Buy only above EMA200, Sell only below EMA200</p>
+            <p><b>Stoploss:</b> {SL_POINTS} points</p>
+            <p><b>RR:</b> 1 : {RR}</p>
+            <p><b>Takeprofit:</b> {TP_POINTS} points</p>
         </div>
 
         <div class="box">
@@ -327,9 +318,8 @@ if __name__ == "__main__":
         print("No data found after this start date.")
         exit()
 
-    # Calculate indicators
-    df = calculate_bollinger(df, BB_PERIOD, BB_STD)
-    df["RSI"] = calculate_rsi(df["Close"], RSI_PERIOD)
+    df = add_previous_day_levels(df)
+    df = add_ema(df, EMA_PERIOD)
 
     start_range = df.index.min()
     end_range = df.index.max()

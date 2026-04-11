@@ -5,7 +5,8 @@ import os
 # SETTINGS
 # -----------------------
 RR = 2.5
-BUFFER = 0.20   # 2 pips approx for XAUUSD
+BUFFER = 0.20   # XAUUSD buffer
+EMA_PERIOD = 200
 
 DATA_FILE = "/Users/prathapd/Documents/forex_backtesting/data/xauusd-m15-bid-2025-04-10-2026-04-10.csv"
 
@@ -34,6 +35,7 @@ def detect_entries(df):
         high = row["High"]
         low = row["Low"]
         close = row["Close"]
+        ema = row["EMA200"]
 
         # reset daily state
         if current_day != date:
@@ -52,8 +54,11 @@ def detect_entries(df):
 
         if breakout_ready and not traded_today:
 
-            # BUY breakout
-            if high > ny_high and close > ny_high:
+            # BUY breakout (EMA filter)
+            if (
+                high > ny_high and close > ny_high
+                and close > ema
+            ):
                 sl = ny_low - BUFFER
 
                 trades.append({
@@ -66,8 +71,11 @@ def detect_entries(df):
 
                 traded_today = True
 
-            # SELL breakout
-            elif low < ny_low and close < ny_low:
+            # SELL breakout (EMA filter)
+            elif (
+                low < ny_low and close < ny_low
+                and close < ema
+            ):
                 sl = ny_high + BUFFER
 
                 trades.append({
@@ -181,9 +189,6 @@ def generate_report(trades_df):
     win_rate = (wins / total) * 100 if total > 0 else 0
     net_profit = trades_df["pnl"].sum()
 
-    # -----------------------
-    # METRICS
-    # -----------------------
     max_tp = wins_df["pnl"].max() if len(wins_df) > 0 else 0
     max_loss = losses_df["pnl"].min() if len(losses_df) > 0 else 0
 
@@ -210,9 +215,6 @@ def generate_report(trades_df):
             streak = streak - 1 if streak < 0 else -1
             max_loss_streak = max(max_loss_streak, abs(streak))
 
-    # -----------------------
-    # HTML
-    # -----------------------
     html = f"""
     <html>
     <head>
@@ -246,7 +248,7 @@ def generate_report(trades_df):
 
     <body>
 
-    <h1>NY 9:30 Breakout Strategy Report</h1>
+    <h1>NY 9:30 Breakout + EMA200 Strategy Report</h1>
 
     <div class="box">
         <h2>Summary</h2>
@@ -310,6 +312,11 @@ if __name__ == "__main__":
     df["Date"] = pd.to_datetime(df["Date"], unit="ms")
     df["Date"] = df["Date"].dt.tz_localize("UTC")
     df = df.set_index("Date")
+
+    # -----------------------
+    # EMA200 CALCULATION
+    # -----------------------
+    df["EMA200"] = df["Close"].ewm(span=EMA_PERIOD, adjust=False).mean()
 
     df = df[df.index >= start_date]
 
